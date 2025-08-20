@@ -35,12 +35,17 @@ POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
 # Через сколько минут без отрицательного фонда сбрасывать прогресс
 RESET_MIN = int(os.getenv("RESET_MIN", "30"))
 
+# Сильный алерт (например, −2%)
+STRONG_ALERT_PCT = float(os.getenv("STRONG_ALERT_PCT", "2.0"))
+STRONG_COOLDOWN_MIN = int(os.getenv("STRONG_COOLDOWN_MIN", "60"))
+
 DB_PATH = "subs.db"
 
 # ====== ПАМЯТЬ/СОСТОЯНИЯ ======
 last_step_idx: Dict[str, int] = defaultdict(lambda: -1)  # последняя отправленная "ступень" для символа
 last_below_ts: Dict[str, datetime] = defaultdict(lambda: datetime.fromtimestamp(0, tz=timezone.utc))
 recent_rates: Dict[str, Deque[Tuple[datetime, float]]] = defaultdict(lambda: deque(maxlen=10))  # последние значения
+last_strong_alert_at: Dict[str, datetime] = defaultdict(lambda: datetime.fromtimestamp(0, tz=timezone.utc))
 
 # ====== БД ПОДПИСЧИКОВ ======
 CREATE_SQL = """
@@ -159,8 +164,35 @@ async def poll_loop(bot: Bot):
                     # копим последние значения для оценки темпа
                     recent_rates[sym].append((now, r))
 
-                    # если выше порога −1% — возможно сброс
-                    if pct(r) > -start_neg_pct:
+                    # ---------- СИЛЬНЫЙ АЛЕРТ (например, -2.00%) ----------
+                    current_pct = pct(r)  # уже в %
+                    if current_pct <= -STRONG_ALERT_PCT:
+                        cooldown_ok = now >= (last_strong_alert_at[sym] + timedelta(minutes=STRONG_COOLDOWN_MIN))
+                        if cooldown_ok:
+                            # простой темп по последним ~5 точкам
+                            rate_list = [x for (_, x) in list(recent_rates[sym])[-5:]]
+                            delta_bps = (bps(rate_list[-1]) - bps(rate_list[0])) if len(rate_list) >= 2 else 0.0
+
+                            text = (
+                                f"🔴 <b>СИЛЬНЫЙ АЛЕРТ</b> — {sym}\n"
+                                f"• Funding: <b>{fmt_pct(r)}</b> (≤ -{STRONG_ALERT_PCT:.2f}%)\n"
+                                f"• Темп за ~{min(len(rate_list)*POLL_SECONDS//60, 5)}м: <b>{delta_bps:.1f} б.п.</b>\n"
+                                f"• Следующая выплата через: <b>{human_eta_ms(nextT)}</b>"
+                            )
+                            for chat_id in subs:
+                                try:
+                                    await bot.send_message(chat_id, text)
+                                except Exception as e:
+                                    logging.warning(f"send_message error chat {chat_id}: {e}")
+
+                            last_strong_alert_at[sym] = now
+                            # синхронизируем ступени, чтобы не дублировать «обычный» алерт этим же тиком
+                            idx_now = step_index(abs(current_pct), start_neg_pct, step_pct)
+                            last_step_idx[sym] = max(last_step_idx[sym], idx_now)
+                            continue  # переходим к следующему символу
+
+                    # ---------- ОБЫЧНАЯ ЛОГИКА (ступени от -1%) ----------
+                    if current_pct > -start_neg_pct:
                         # если давно выше порога — сбросить ступени
                         if (now - last_below_ts[sym]) > timedelta(minutes=RESET_MIN):
                             last_step_idx[sym] = -1
@@ -170,7 +202,7 @@ async def poll_loop(bot: Bot):
                     last_below_ts[sym] = now
 
                     # индекс текущей ступени по абсолютному значению
-                    idx = step_index(abs(pct(r)), start_neg_pct, step_pct)
+                    idx = step_index(abs(current_pct), start_neg_pct, step_pct)
                     if idx > last_step_idx[sym] >= -1:
                         # оценим простой "темп" по последним точкам (до ~5 измерений)
                         rate_list = [x for (_, x) in list(recent_rates[sym])[-5:]]
@@ -231,9 +263,9 @@ async def main():
         await m.answer(
             "Привет! Я слежу за funding rate по <b>всем</b> фьючерсным контрактам Binance.\n\n"
             "Правила сигналов:\n"
-            f"• Пара вошла в зону ниже <b>-{START_NEG_PCT:.2f}%</b>\n"
-            f"• Дальше шлются ступени по <b>{STEP_BPS} б.п.</b> "
-            f"(например: -1.20%, -1.40%, -1.60% …)\n"
+            f"• Порог входа: ниже <b>-{START_NEG_PCT:.2f}%</b>\n"
+            f"• Ступени: <b>{STEP_BPS} б.п.</b> (например: -1.20%, -1.40%, ...)\n"
+            f"• Сильный алерт: при ≤ <b>-{STRONG_ALERT_PCT:.2f}%</b> (кулдаун {STRONG_COOLDOWN_MIN} мин)\n"
             f"• Период опроса: <b>{POLL_SECONDS}s</b>\n\n"
             "Команды:\n"
             "• /subscribe — включить сигналы\n"
@@ -257,8 +289,9 @@ async def main():
             "⚙️ Настройки:\n"
             f"• Порог входа: -{START_NEG_PCT:.2f}%\n"
             f"• Шаг ступени: {STEP_BPS} б.п. (~{STEP_BPS/100:.2f}%)\n"
+            f"• Сильный алерт: ≤ -{STRONG_ALERT_PCT:.2f}% (кулдаун {STRONG_COOLDOWN_MIN} мин)\n"
             f"• Опрос: {POLL_SECONDS} сек\n"
-            f"• Сброс после: {RESET_MIN} мин без ухода ниже порога"
+            f"• Сброс ступеней: после {RESET_MIN} мин вне зоны"
         )
 
     loop = asyncio.get_event_loop()
