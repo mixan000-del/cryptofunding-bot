@@ -1,0 +1,5 @@
+aiogram==3.*
+websockets==12.*
+aiosqlite
+python-dotenv
+aiohttp
