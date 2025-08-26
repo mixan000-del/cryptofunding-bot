@@ -1,7 +1,9 @@
-import os, time, json, math, requests, sys
+import os, time, json, math, asyncio, sys
+import aiohttp
 
-# === Binance endpoint (можно переопределить через ENV) ===
-BINANCE_URL = os.getenv("BINANCE_URL", "https://fapi.binance.com/fapi/v1/premiumIndex")
+OKX_BASE = os.getenv("OKX_BASE", "https://www.okx.com")
+INSTRUMENTS_URL = f"{OKX_BASE}/api/v5/public/instruments?instType=SWAP"
+FUNDING_URL     = f"{OKX_BASE}/api/v5/public/funding-rate?instId="
 
 # === ENV ===
 POLL_SEC      = int(os.getenv("POLL_SEC", "30"))
@@ -9,45 +11,47 @@ THRESHOLD     = float(os.getenv("THRESHOLD", "-1.0"))
 DOWN_STEP     = float(os.getenv("DOWN_STEP", "0.25"))
 REBOUND_STEP  = float(os.getenv("REBOUND_STEP", "0.05"))
 REBOUND_START = float(os.getenv("REBOUND_START", "-2.0"))
-ONLY_USDT     = os.getenv("ONLY_USDT", "1") not in ("0","false","False")
 SNAPSHOT_MODE = os.getenv("SNAPSHOT_MODE", "0") not in ("0","false","False")
+UPDATE_POLL   = int(os.getenv("UPDATE_POLL", "2"))
+REFRESH_INSTR = int(os.getenv("REFRESH_INSTR", "600"))  # обновлять список инструментов каждые 10 мин
+
 TG_TOKEN      = os.getenv("TG_TOKEN", "")
 TG_CHAT_ID    = os.getenv("TG_CHAT_ID", "")
-STATE_FILE    = os.getenv("STATE_FILE", "/data/funding_state.json")
-UPDATE_POLL   = int(os.getenv("UPDATE_POLL", "2"))
+STATE_FILE    = os.getenv("STATE_FILE", "/data/okx_funding_state.json")
 
-# === PROXY (опционально) ===
-# Пример: http://user:pass@host:port  или  http://host:port
-PROXY_URL = os.getenv("PROXY_URL", "").strip()
-PROXIES = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+# Лимиты OKX публичного API: ориентируемся на ~10 запросов/сек.
+CONCURRENCY   = int(os.getenv("CONCURRENCY", "10"))  # одновременных запросов
+TIMEOUT_SEC   = int(os.getenv("TIMEOUT_SEC", "15"))
 
 def log(*a): print(*a, flush=True)
 
-# --- Telegram ---
-def tg_send_text(chat_id, text, reply_markup=None):
+# ========== Telegram ==========
+async def tg_send_text(session, chat_id, text, reply_markup=None):
     if not TG_TOKEN or not chat_id: return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
     if reply_markup: payload["reply_markup"] = reply_markup
     try:
-        requests.post(url, json=payload, timeout=20)
+        async with session.post(url, json=payload, timeout=TIMEOUT_SEC) as r:
+            await r.read()
     except Exception as e:
         log("TG send error:", e)
 
-def tg_answer_cbq(cb_id, text="OK", show_alert=False):
+async def tg_answer_cbq(session, cb_id, text="OK", show_alert=False):
     if not TG_TOKEN: return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/answerCallbackQuery"
     try:
-        requests.post(url, json={"callback_query_id": cb_id, "text": text, "show_alert": show_alert}, timeout=15)
+        async with session.post(url, json={"callback_query_id": cb_id, "text": text, "show_alert": show_alert}, timeout=TIMEOUT_SEC) as r:
+            await r.read()
     except Exception as e:
         log("TG cbq error:", e)
 
-def tg_get_updates(offset):
+async def tg_get_updates(session, offset):
     if not TG_TOKEN: return offset, []
     url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates"
     try:
-        r = requests.get(url, params={"timeout": 0, "offset": offset}, timeout=20)
-        data = r.json()
+        async with session.get(url, params={"timeout": 0, "offset": offset}, timeout=TIMEOUT_SEC) as r:
+            data = await r.json()
         if not data.get("ok"): return offset, []
         updates = data.get("result", [])
         new_offset = offset
@@ -56,13 +60,26 @@ def tg_get_updates(offset):
     except Exception:
         return offset, []
 
-# --- State ---
+def status_keyboard():
+    return {"inline_keyboard": [[{"text": "🔎 Проверить сейчас", "callback_data": "check_now"}]]}
+
+def format_status(meta, last_err=None):
+    last_ts = meta.get("last_scan_ts", 0); hits = meta.get("last_hits", 0); inst_n = meta.get("inst_count", 0)
+    ts_txt = f"<t:{last_ts}:T> (<t:{last_ts}:R>)" if last_ts else "—"
+    err = f"\nПоследняя ошибка запроса: {last_err}" if last_err else ""
+    return (f"🟢 OKX бот запущен\n"
+            f"Инструментов (SWAP): {inst_n}\n"
+            f"Режим: автоскан {POLL_SEC}s\n"
+            f"Порог: ≤{THRESHOLD:.2f}% | Вниз {DOWN_STEP:.2f}% | Откат {REBOUND_STEP:.2f}% от {REBOUND_START:.2f}%\n"
+            f"Последний скан: {ts_txt}\nСовпадений: {hits}{err}")
+
+# ========== State ==========
 def load_state():
     try:
         with open(STATE_FILE, "r") as f:
             return json.load(f)
     except:
-        return {"symbols": {}, "meta": {"last_scan_ts": 0, "last_hits": 0}}
+        return {"symbols": {}, "meta": {"last_scan_ts": 0, "last_hits": 0, "inst_count": 0}}
 
 def save_state(state):
     try:
@@ -72,8 +89,8 @@ def save_state(state):
     except Exception as e:
         log("Save state error:", e)
 
-# --- Funding logic ---
-def to_pct(v): 
+# ========== Funding logic ==========
+def to_pct(v):
     try: return float(v) * 100.0
     except: return 0.0
 
@@ -90,9 +107,10 @@ def grid_rebound(rate_pct):
     if lvl > THRESHOLD: lvl = THRESHOLD
     return round(lvl, 2)
 
-def fmt_msg(sym, curr, tag): return f"{tag} {sym}: фандинг {curr:.2f}%"
+def fmt_msg(inst_id, curr, tag):  # instId вида BTC-USDT-SWAP
+    return f"{tag} {inst_id}: фандинг {curr:.2f}%"
 
-def process_symbol(sym, curr_pct, st):
+def process_symbol(inst_id, curr_pct, st):
     if curr_pct > THRESHOLD: return [], None
     if st is None: st = {"last_sent": None, "min_seen": None, "touched_rebound": False, "last_mode": None}
     if st["min_seen"] is None or curr_pct < st["min_seen"]: st["min_seen"] = curr_pct
@@ -107,101 +125,147 @@ def process_symbol(sym, curr_pct, st):
     if level is None: return [], st
 
     if last is None or (tag == "⬇️" and level < last) or (tag == "↗️" and level > last):
-        msgs.append(fmt_msg(sym, curr_pct, tag)); st["last_sent"] = level
+        msgs.append(fmt_msg(inst_id, curr_pct, tag)); st["last_sent"] = level
     return msgs, st
-
-def fetch_currents():
-    try:
-        r = requests.get(BINANCE_URL, timeout=25, proxies=PROXIES)
-        if r.status_code == 451:
-            # Гео-блок. Не падаем — лог и пустой список, чтобы цикл жил дальше.
-            raise requests.HTTPError("451 Unavailable for legal reasons")
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        # Сообщим в лог и вернём пустой список (бот продолжит жить)
-        log(f"Fetch error on {BINANCE_URL}: {e}")
-        return [], str(e)
-
-    if isinstance(data, dict): data = [data]
-    rows = []
-    for x in data:
-        sym = x.get("symbol", "")
-        if ONLY_USDT and not sym.endswith("USDT"): continue
-        curr_pct = to_pct(x.get("lastFundingRate", 0.0))
-        if curr_pct <= THRESHOLD: rows.append((sym, curr_pct))
-    rows.sort(key=lambda t: t[1])
-    return rows, None
 
 def snapshot_text(rows):
     ts = int(time.time())
-    lines = [f"📊 Фандинг ≤ {THRESHOLD:.2f}% (каждые {POLL_SEC}s)",
+    lines = [f"📊 OKX: фандинг ≤ {THRESHOLD:.2f}% (каждые {POLL_SEC}s)",
              f"Время: <t:{ts}:T>  (<t:{ts}:R>)",
-             "—"*28]
-    for sym, curr in rows:
-        lines.append(f"{sym:>10}  {curr:.2f}%")
+             "—" * 32]
+    for inst_id, curr in rows:
+        lines.append(f"{inst_id:>16}  {curr:.2f}%")
     return "\n".join(lines)
 
-def status_keyboard():
-    return {"inline_keyboard": [[{"text": "🔎 Проверить сейчас", "callback_data": "check_now"}]]}
+# ========== OKX fetch ==========
+async def fetch_instruments(session):
+    try:
+        async with session.get(INSTRUMENTS_URL, timeout=TIMEOUT_SEC) as r:
+            data = await r.json()
+        arr = data.get("data", [])
+        # instId пример: BTC-USDT-SWAP
+        inst_ids = [x["instId"] for x in arr if x.get("instId","").endswith("-SWAP")]
+        return inst_ids, None
+    except Exception as e:
+        return [], str(e)
 
-def format_status(meta, last_err=None):
-    last_ts = meta.get("last_scan_ts", 0); hits = meta.get("last_hits", 0)
-    ts_txt = f"<t:{last_ts}:T> (<t:{last_ts}:R>)" if last_ts else "—"
-    err = f"\nПоследняя ошибка запроса: {last_err}" if last_err else ""
-    proxy = f"\nПрокси: {'ON' if PROXY_URL else 'OFF'}"
-    return (f"🟢 Бот запущен\n"
-            f"Endpoint: {BINANCE_URL}{proxy}\n"
-            f"Режим: автоскан {POLL_SEC}s\n"
-            f"Порог: ≤{THRESHOLD:.2f}% | Шаг вниз {DOWN_STEP:.2f}% | Откат {REBOUND_STEP:.2f}% от {REBOUND_START:.2f}%\n"
-            f"Последний скан: {ts_txt}\nСовпадений: {hits}{err}")
+async def fetch_funding_one(session, inst_id, sem):
+    url = FUNDING_URL + inst_id
+    async with sem:
+        try:
+            async with session.get(url, timeout=TIMEOUT_SEC) as r:
+                data = await r.json()
+            arr = data.get("data", [])
+            if not arr: return inst_id, None, "empty"
+            # берем fundingRate (текущий / предсказанный)
+            rate = to_pct(arr[0].get("fundingRate", 0.0))
+            return inst_id, rate, None
+        except Exception as e:
+            return inst_id, None, str(e)
 
-# --- Main ---
-def main():
+async def scan_once(session, inst_ids):
+    sem = asyncio.Semaphore(CONCURRENCY)
+    tasks = [fetch_funding_one(session, iid, sem) for iid in inst_ids]
+    out = []
+    errors = []
+    for coro in asyncio.as_completed(tasks):
+        iid, rate, err = await coro
+        if err:
+            errors.append((iid, err)); continue
+        if rate <= THRESHOLD:
+            out.append((iid, rate))
+    # сортируем по убыванию (самые минусовые сверху)
+    out.sort(key=lambda t: t[1])
+    return out, errors
+
+# ========== Main loop ==========
+async def main():
     if not TG_TOKEN or not TG_CHAT_ID:
         log("ERROR: set TG_TOKEN,TG_CHAT_ID"); sys.exit(1)
-    state = load_state(); sym_state = state.get("symbols", {}); meta = state.get("meta", {"last_scan_ts":0,"last_hits":0})
-    next_scan_at, next_upd_at, upd_offset = 0, 0, 0
+
+    state = load_state()
+    sym_state = state.get("symbols", {})
+    meta = state.get("meta", {"last_scan_ts": 0, "last_hits": 0, "inst_count": 0})
     last_fetch_error = None
-    log("Started: poll",POLL_SEC,"sec | Endpoint:", BINANCE_URL, "| Proxy:", "ON" if PROXY_URL else "OFF")
+    updates_offset = 0
+    next_scan_at = 0
+    next_updates_at = 0
+    next_refresh_inst = 0
+    inst_ids = []
 
-    while True:
-        now = time.time()
-        # Telegram updates
-        if now >= next_upd_at:
-            next_upd_at = now + UPDATE_POLL
-            upd_offset, updates = tg_get_updates(upd_offset)
-            for u in updates:
-                msg, cbq = u.get("message") or {}, u.get("callback_query")
-                if msg and msg.get("text","").startswith("/status"):
-                    tg_send_text(msg["chat"]["id"], format_status(meta, last_fetch_error), reply_markup=status_keyboard())
-                if cbq and cbq.get("data")=="check_now":
-                    rows, err = fetch_currents()
-                    meta["last_scan_ts"]=int(time.time()); meta["last_hits"]=len(rows); last_fetch_error = err
-                    tg_send_text(cbq["message"]["chat"]["id"],
-                                 snapshot_text(rows) if rows else ("🆗 Ни одной монеты ≤ порога сейчас." + (f"\n⚠️ {err}" if err else "")))
-                    tg_answer_cbq(cbq["id"], "Готово")
+    timeout = aiohttp.ClientTimeout(total=None)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        # первичная загрузка инструментов
+        inst_ids, err = await fetch_instruments(session)
+        last_fetch_error = err
+        meta["inst_count"] = len(inst_ids)
+        save_state({"symbols": sym_state, "meta": meta})
+        log(f"OKX SWAP instruments: {len(inst_ids)}")
 
-        # Auto scan
-        if now >= next_scan_at:
-            next_scan_at = now + POLL_SEC
-            rows, err = fetch_currents()
-            meta["last_scan_ts"]=int(time.time()); meta["last_hits"]=len(rows); last_fetch_error = err
+        while True:
+            now = time.time()
 
-            if SNAPSHOT_MODE and rows:
-                tg_send_text(TG_CHAT_ID, snapshot_text(rows))
-            for sym,curr in rows:
-                st = sym_state.get(sym); msgs,new_st = process_symbol(sym,curr,st)
-                sym_state[sym]=new_st
-                for m in msgs: tg_send_text(TG_CHAT_ID, m)
+            # Telegram updates
+            if now >= next_updates_at:
+                next_updates_at = now + UPDATE_POLL
+                updates_offset, updates = await tg_get_updates(session, updates_offset)
+                for u in updates:
+                    msg, cbq = u.get("message") or {}, u.get("callback_query")
+                    if msg and str(msg.get("text","")).startswith("/status"):
+                        await tg_send_text(session, msg["chat"]["id"], format_status(meta, last_fetch_error),
+                                           reply_markup=status_keyboard())
+                    if cbq and cbq.get("data") == "check_now":
+                        rows, _ = await scan_once(session, inst_ids)
+                        meta["last_scan_ts"] = int(time.time()); meta["last_hits"] = len(rows)
+                        await tg_send_text(session, cbq["message"]["chat"]["id"],
+                                           snapshot_text(rows) if rows else "🆗 Ни одной монеты ≤ порога сейчас.")
+                        await tg_answer_cbq(session, cbq["id"], "Готово")
 
-            # сброс тех, кто вышел выше порога
-            active = {s for s,_ in rows}
-            for s in list(sym_state.keys()):
-                if s not in active: sym_state.pop(s, None)
+            # Периодически обновляем список инструментов
+            if now >= next_refresh_inst:
+                next_refresh_inst = now + REFRESH_INSTR
+                inst_ids, err = await fetch_instruments(session)
+                if not err and inst_ids:
+                    meta["inst_count"] = len(inst_ids)
+                    save_state({"symbols": sym_state, "meta": meta})
+                    log(f"Refreshed instruments: {len(inst_ids)}")
+                else:
+                    last_fetch_error = err or last_fetch_error
 
-            state["symbols"],state["meta"]=sym_state,meta; save_state(state)
+            # Автоскан
+            if now >= next_scan_at:
+                next_scan_at = now + POLL_SEC
+                rows, errs = await scan_once(session, inst_ids)
+                meta["last_scan_ts"] = int(time.time()); meta["last_hits"] = len(rows)
+                if errs:
+                    # запомним лишь последнюю ошибку для /status
+                    last_fetch_error = f"{errs[0][0]}: {errs[0][1]}"
 
-        time.sleep(0.5)
+                # Снапшот-сообщение (опционально)
+                if SNAPSHOT_MODE and rows:
+                    await tg_send_text(session, TG_CHAT_ID, snapshot_text(rows))
 
-if __name__=="__main__": main()
+                # Асимметричные триггеры
+                for inst_id, curr in rows:
+                    st = sym_state.get(inst_id)
+                    msgs, new_st = process_symbol(inst_id, curr, st)
+                    sym_state[inst_id] = new_st
+                    for m in msgs:
+                        await tg_send_text(session, TG_CHAT_ID, m)
+
+                # сброс тех, кто вышел выше порога
+                active = {iid for iid, _ in rows}
+                for s in list(sym_state.keys()):
+                    if s not in active:
+                        sym_state.pop(s, None)
+
+                state["symbols"], state["meta"] = sym_state, meta
+                save_state(state)
+
+            await asyncio.sleep(0.2)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
