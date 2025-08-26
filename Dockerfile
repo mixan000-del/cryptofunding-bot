@@ -7,16 +7,21 @@ ENV PYTHONUNBUFFERED=1
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py .
+COPY bot_okx.py .
 
 VOLUME ["/data"]
-ENV STATE_FILE=/data/funding_state.json
+ENV STATE_FILE=/data/okx_funding_state.json
+
+# Настраиваемые параметры (можно менять в Koyeb → Environment):
 ENV POLL_SEC=30
 ENV THRESHOLD=-1.0
 ENV DOWN_STEP=0.25
 ENV REBOUND_STEP=0.05
 ENV REBOUND_START=-2.0
-ENV ONLY_USDT=1
 ENV SNAPSHOT_MODE=0
+ENV UPDATE_POLL=2
+ENV REFRESH_INSTR=600
+ENV CONCURRENCY=10
+ENV TIMEOUT_SEC=15
 
-CMD ["python", "bot.py"]
+CMD ["python", "bot_okx.py"]
