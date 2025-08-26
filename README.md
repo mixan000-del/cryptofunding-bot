@@ -1,40 +1,40 @@
-# Binance Funding Telegram Bot (Koyeb)
+# OKX Funding Telegram Bot (Koyeb)
 
-Бот мониторит Binance funding rate и шлёт сигналы в Telegram.
+Бот мониторит **все SWAP-инструменты на OKX** (перпетуальные фьючерсы) и
+присылает сигналы в Telegram:
+- вход в зону при `≤ -1.00%`;
+- углубление вниз шагом `0.25%`;
+- после того как инструмент был `≤ -2.00%`, откат вверх шагом `0.05%`;
+- авто-скан раз в `30s`, есть `/status` и кнопка «Проверить сейчас»;
+- опционально снапшот-список всех совпадений каждый цикл (`SNAPSHOT_MODE=1`).
 
-## Возможности
-- Автоскан каждые 30s (можно менять `POLL_SEC`).
-- Порог включения: `THRESHOLD` (по умолчанию -1.0%).
-- Шаг вниз: `DOWN_STEP` (0.25%), шаг отката от `REBOUND_START` (-2.0%) вверх: `REBOUND_STEP` (0.05%).
-- Команда /status в Telegram показывает состояние + кнопку «Проверить сейчас».
+## Переменные окружения (Koyeb → Environment)
+- `TG_TOKEN` **(required)** — токен от @BotFather
+- `TG_CHAT_ID` **(required)** — id вашего чата/канала
+- `STATE_FILE` (default `/data/okx_funding_state.json`) — файл состояния
+- `POLL_SEC` (default `30`)
+- `THRESHOLD` (default `-1.0`)
+- `DOWN_STEP` (default `0.25`)
+- `REBOUND_STEP` (default `0.05`)
+- `REBOUND_START` (default `-2.0`)
+- `SNAPSHOT_MODE` (default `0`) — `1` чтобы слать общий список каждый цикл
+- `REFRESH_INSTR` (default `600`) — как часто обновлять список инструментов (сек)
+- `CONCURRENCY` (default `10`) — параллельных запросов к API OKX
+- `TIMEOUT_SEC` (default `15`)
+- `OKX_BASE` (опц.) — базовый URL OKX API
 
 ## Деплой на Koyeb
-1. Загрузите эти файлы в GitHub.
-2. На Koyeb → Create App → Deploy Service → выберите репозиторий.
-3. Runtime: Dockerfile.
-4. Environment variables:
-   - `TG_TOKEN` — токен вашего бота.
-   - `TG_CHAT_ID` — ваш chat id.
-   - (опционально) `POLL_SEC`, `THRESHOLD`, `DOWN_STEP`, `REBOUND_STEP`, `REBOUND_START`.
-   - `STATE_FILE=/data/funding_state.json`.
-5. Добавьте Volume → mount path `/data`.
-6. Deploy.
+1. Залейте файлы в GitHub.
+2. Create App → Deploy Service → GitHub repo → Runtime: Dockerfile.
+3. Environment: задайте все `TG_*` и остальные переменные (см. выше).
+4. Volumes: добавьте volume и примонтируйте к `/data`.
+5. Scaling: Minimum=1, Maximum=1, без scale-to-zero.
+6. Deploy. Логи → “Started” и число SWAP-инструментов.
 
-## Проверка
-- Напишите боту `/status`.
-- Нажмите кнопку «Проверить сейчас».
-- Бот ответит текущим списком монет ниже порога.
+## Команды
+- `/status` — показывает состояние и кнопку «Проверить сейчас».
 
-## Локально
-```bash
-export TG_TOKEN=... TG_CHAT_ID=...
-docker build -t funding-bot .
-docker run --rm -e TG_TOKEN -e TG_CHAT_ID -v $(pwd)/data:/data funding-bot
-## Если видите ошибку 451 (Unavailable for legal reasons)
-Это гео-блок IP дата-центра. Варианты:
-1) Задать прокси:
-   - В Koyeb → Environment variables → `PROXY_URL=http://host:port`
-     (или `http://user:pass@host:port`), бот начнёт ходить через него.
-2) Поменять регион/провайдера (например, развернуть на другом хостинге,
-   где доступ к Binance не блокируется).
-3) Указать собственный BINANCE_URL (проксирующий endpoint), если у вас есть.
+## Примечания
+- Бот запрашивает список инструментов (`/public/instruments?instType=SWAP`) и каждые `POLL_SEC`
+  параллельно тянет `funding-rate?instId=...` для всех SWAP. Результаты фильтруются `≤ THRESHOLD`.
+- Если монет много, можно уменьшить `CONCURRENCY` (снизит нагрузку), либо увеличить `POLL_SEC`.
