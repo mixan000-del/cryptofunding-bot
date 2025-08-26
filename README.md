@@ -30,3 +30,11 @@
 export TG_TOKEN=... TG_CHAT_ID=...
 docker build -t funding-bot .
 docker run --rm -e TG_TOKEN -e TG_CHAT_ID -v $(pwd)/data:/data funding-bot
+## Если видите ошибку 451 (Unavailable for legal reasons)
+Это гео-блок IP дата-центра. Варианты:
+1) Задать прокси:
+   - В Koyeb → Environment variables → `PROXY_URL=http://host:port`
+     (или `http://user:pass@host:port`), бот начнёт ходить через него.
+2) Поменять регион/провайдера (например, развернуть на другом хостинге,
+   где доступ к Binance не блокируется).
+3) Указать собственный BINANCE_URL (проксирующий endpoint), если у вас есть.
