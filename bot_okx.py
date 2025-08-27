@@ -1,31 +1,29 @@
 import os, time, json, math, asyncio, sys
 import aiohttp
 
-OKX_BASE = os.getenv("OKX_BASE", "https://www.okx.com")
-INSTRUMENTS_URL = f"{OKX_BASE}/api/v5/public/instruments?instType=SWAP"
-FUNDING_URL     = f"{OKX_BASE}/api/v5/public/funding-rate?instId="
+BINANCE_URL = os.getenv("BINANCE_URL", "https://fapi.binance.com/fapi/v1/premiumIndex")
 
 # === ENV ===
 POLL_SEC      = int(os.getenv("POLL_SEC", "30"))
-THRESHOLD     = float(os.getenv("THRESHOLD", "-1.0"))
-DOWN_STEP     = float(os.getenv("DOWN_STEP", "0.25"))
-REBOUND_STEP  = float(os.getenv("REBOUND_STEP", "0.05"))
-REBOUND_START = float(os.getenv("REBOUND_START", "-2.0"))
+THRESHOLD     = float(os.getenv("THRESHOLD", "-1.0"))      # включать всё <= этого порога (в %)
+DOWN_STEP     = float(os.getenv("DOWN_STEP", "0.25"))      # шаг на углублении
+REBOUND_STEP  = float(os.getenv("REBOUND_STEP", "0.05"))   # шаг на откате после -2%
+REBOUND_START = float(os.getenv("REBOUND_START", "-2.0"))  # точка включения сетки отката
+ONLY_USDT     = os.getenv("ONLY_USDT", "1") not in ("0","false","False")
 SNAPSHOT_MODE = os.getenv("SNAPSHOT_MODE", "0") not in ("0","false","False")
 UPDATE_POLL   = int(os.getenv("UPDATE_POLL", "2"))
-REFRESH_INSTR = int(os.getenv("REFRESH_INSTR", "600"))  # обновлять список инструментов каждые 10 мин
+TIMEOUT_SEC   = int(os.getenv("TIMEOUT_SEC", "15"))
 
 TG_TOKEN      = os.getenv("TG_TOKEN", "")
 TG_CHAT_ID    = os.getenv("TG_CHAT_ID", "")
-STATE_FILE    = os.getenv("STATE_FILE", "/data/okx_funding_state.json")
+STATE_FILE    = os.getenv("STATE_FILE", "/data/binance_funding_state.json")
 
-# Лимиты OKX публичного API: ориентируемся на ~10 запросов/сек.
-CONCURRENCY   = int(os.getenv("CONCURRENCY", "10"))  # одновременных запросов
-TIMEOUT_SEC   = int(os.getenv("TIMEOUT_SEC", "15"))
+# Прокси (HTTP/SOCKS5 через aiohttp 'proxy' параметр)
+PROXY_URL     = os.getenv("PROXY_URL", "").strip()  # http://user:pass@host:port
 
 def log(*a): print(*a, flush=True)
 
-# ========== Telegram ==========
+# ========= Telegram =========
 async def tg_send_text(session, chat_id, text, reply_markup=None):
     if not TG_TOKEN or not chat_id: return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
@@ -67,13 +65,14 @@ def format_status(meta, last_err=None):
     last_ts = meta.get("last_scan_ts", 0); hits = meta.get("last_hits", 0); inst_n = meta.get("inst_count", 0)
     ts_txt = f"<t:{last_ts}:T> (<t:{last_ts}:R>)" if last_ts else "—"
     err = f"\nПоследняя ошибка запроса: {last_err}" if last_err else ""
-    return (f"🟢 OKX бот запущен\n"
-            f"Инструментов (SWAP): {inst_n}\n"
+    proxy = f"\nProxy: {'ON' if PROXY_URL else 'OFF'}"
+    return (f"🟢 Binance бот запущен\n"
+            f"Перпов (USDT): {inst_n}{proxy}\n"
             f"Режим: автоскан {POLL_SEC}s\n"
             f"Порог: ≤{THRESHOLD:.2f}% | Вниз {DOWN_STEP:.2f}% | Откат {REBOUND_STEP:.2f}% от {REBOUND_START:.2f}%\n"
             f"Последний скан: {ts_txt}\nСовпадений: {hits}{err}")
 
-# ========== State ==========
+# ========= State =========
 def load_state():
     try:
         with open(STATE_FILE, "r") as f:
@@ -89,7 +88,7 @@ def save_state(state):
     except Exception as e:
         log("Save state error:", e)
 
-# ========== Funding logic ==========
+# ========= Funding logic =========
 def to_pct(v):
     try: return float(v) * 100.0
     except: return 0.0
@@ -107,10 +106,10 @@ def grid_rebound(rate_pct):
     if lvl > THRESHOLD: lvl = THRESHOLD
     return round(lvl, 2)
 
-def fmt_msg(inst_id, curr, tag):  # instId вида BTC-USDT-SWAP
-    return f"{tag} {inst_id}: фандинг {curr:.2f}%"
+def fmt_msg(sym, curr, tag):
+    return f"{tag} {sym}: фандинг {curr:.2f}%"
 
-def process_symbol(inst_id, curr_pct, st):
+def process_symbol(sym, curr_pct, st):
     if curr_pct > THRESHOLD: return [], None
     if st is None: st = {"last_sent": None, "min_seen": None, "touched_rebound": False, "last_mode": None}
     if st["min_seen"] is None or curr_pct < st["min_seen"]: st["min_seen"] = curr_pct
@@ -125,60 +124,48 @@ def process_symbol(inst_id, curr_pct, st):
     if level is None: return [], st
 
     if last is None or (tag == "⬇️" and level < last) or (tag == "↗️" and level > last):
-        msgs.append(fmt_msg(inst_id, curr_pct, tag)); st["last_sent"] = level
+        msgs.append(fmt_msg(sym, curr_pct, tag)); st["last_sent"] = level
     return msgs, st
 
 def snapshot_text(rows):
     ts = int(time.time())
-    lines = [f"📊 OKX: фандинг ≤ {THRESHOLD:.2f}% (каждые {POLL_SEC}s)",
+    lines = [f"📊 Binance: фандинг ≤ {THRESHOLD:.2f}% (каждые {POLL_SEC}s)",
              f"Время: <t:{ts}:T>  (<t:{ts}:R>)",
-             "—" * 32]
-    for inst_id, curr in rows:
-        lines.append(f"{inst_id:>16}  {curr:.2f}%")
+             "—"*32]
+    for sym, curr in rows:
+        lines.append(f"{sym:>16}  {curr:.2f}%")
     return "\n".join(lines)
 
-# ========== OKX fetch ==========
-async def fetch_instruments(session):
+# ========= Binance fetch =========
+async def fetch_binance(session):
     try:
-        async with session.get(INSTRUMENTS_URL, timeout=TIMEOUT_SEC) as r:
+        kwargs = {}
+        if PROXY_URL:
+            kwargs["proxy"] = PROXY_URL
+        async with session.get(BINANCE_URL, timeout=TIMEOUT_SEC, **kwargs) as r:
+            if r.status == 451:
+                raise RuntimeError("451 from Binance")
             data = await r.json()
-        arr = data.get("data", [])
-        # instId пример: BTC-USDT-SWAP
-        inst_ids = [x["instId"] for x in arr if x.get("instId","").endswith("-SWAP")]
-        return inst_ids, None
     except Exception as e:
-        return [], str(e)
+        return [], 0, str(e)
 
-async def fetch_funding_one(session, inst_id, sem):
-    url = FUNDING_URL + inst_id
-    async with sem:
-        try:
-            async with session.get(url, timeout=TIMEOUT_SEC) as r:
-                data = await r.json()
-            arr = data.get("data", [])
-            if not arr: return inst_id, None, "empty"
-            # берем fundingRate (текущий / предсказанный)
-            rate = to_pct(arr[0].get("fundingRate", 0.0))
-            return inst_id, rate, None
-        except Exception as e:
-            return inst_id, None, str(e)
-
-async def scan_once(session, inst_ids):
-    sem = asyncio.Semaphore(CONCURRENCY)
-    tasks = [fetch_funding_one(session, iid, sem) for iid in inst_ids]
-    out = []
-    errors = []
-    for coro in asyncio.as_completed(tasks):
-        iid, rate, err = await coro
-        if err:
-            errors.append((iid, err)); continue
+    if isinstance(data, dict): data = [data]
+    rows = []
+    inst_count = 0
+    for x in data:
+        sym = x.get("symbol","")
+        # оставляем только USDT перпы
+        if ONLY_USDT and not sym.endswith("USDT"):
+            continue
+        inst_count += 1
+        rate = to_pct(x.get("lastFundingRate", 0.0))
         if rate <= THRESHOLD:
-            out.append((iid, rate))
-    # сортируем по убыванию (самые минусовые сверху)
-    out.sort(key=lambda t: t[1])
-    return out, errors
+            # унифицируем формат имени для сообщений
+            rows.append((f"{sym.replace('USDT','')}-USDT-SWAP", rate))
+    rows.sort(key=lambda t: t[1])
+    return rows, inst_count, None
 
-# ========== Main loop ==========
+# ========= Main loop =========
 async def main():
     if not TG_TOKEN or not TG_CHAT_ID:
         log("ERROR: set TG_TOKEN,TG_CHAT_ID"); sys.exit(1)
@@ -190,17 +177,10 @@ async def main():
     updates_offset = 0
     next_scan_at = 0
     next_updates_at = 0
-    next_refresh_inst = 0
-    inst_ids = []
 
     timeout = aiohttp.ClientTimeout(total=None)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        # первичная загрузка инструментов
-        inst_ids, err = await fetch_instruments(session)
-        last_fetch_error = err
-        meta["inst_count"] = len(inst_ids)
-        save_state({"symbols": sym_state, "meta": meta})
-        log(f"OKX SWAP instruments: {len(inst_ids)}")
+        log("Binance monitor started. Poll", POLL_SEC, "sec", "| Proxy:", "ON" if PROXY_URL else "OFF")
 
         while True:
             now = time.time()
@@ -215,37 +195,25 @@ async def main():
                         await tg_send_text(session, msg["chat"]["id"], format_status(meta, last_fetch_error),
                                            reply_markup=status_keyboard())
                     if cbq and cbq.get("data") == "check_now":
-                        rows, _ = await scan_once(session, inst_ids)
-                        meta["last_scan_ts"] = int(time.time()); meta["last_hits"] = len(rows)
+                        rows, inst_n, err = await fetch_binance(session)
+                        meta["last_scan_ts"] = int(time.time()); meta["last_hits"] = len(rows); meta["inst_count"] = inst_n
                         await tg_send_text(session, cbq["message"]["chat"]["id"],
                                            snapshot_text(rows) if rows else "🆗 Ни одной монеты ≤ порога сейчас.")
                         await tg_answer_cbq(session, cbq["id"], "Готово")
 
-            # Периодически обновляем список инструментов
-            if now >= next_refresh_inst:
-                next_refresh_inst = now + REFRESH_INSTR
-                inst_ids, err = await fetch_instruments(session)
-                if not err and inst_ids:
-                    meta["inst_count"] = len(inst_ids)
-                    save_state({"symbols": sym_state, "meta": meta})
-                    log(f"Refreshed instruments: {len(inst_ids)}")
-                else:
-                    last_fetch_error = err or last_fetch_error
-
             # Автоскан
             if now >= next_scan_at:
                 next_scan_at = now + POLL_SEC
-                rows, errs = await scan_once(session, inst_ids)
-                meta["last_scan_ts"] = int(time.time()); meta["last_hits"] = len(rows)
-                if errs:
-                    # запомним лишь последнюю ошибку для /status
-                    last_fetch_error = f"{errs[0][0]}: {errs[0][1]}"
+                rows, inst_n, err = await fetch_binance(session)
+                meta["last_scan_ts"] = int(time.time())
+                meta["last_hits"] = len(rows)
+                meta["inst_count"] = inst_n
+                last_fetch_error = err
 
-                # Снапшот-сообщение (опционально)
                 if SNAPSHOT_MODE and rows:
                     await tg_send_text(session, TG_CHAT_ID, snapshot_text(rows))
 
-                # Асимметричные триггеры
+                # триггеры
                 for inst_id, curr in rows:
                     st = sym_state.get(inst_id)
                     msgs, new_st = process_symbol(inst_id, curr, st)
@@ -253,7 +221,7 @@ async def main():
                     for m in msgs:
                         await tg_send_text(session, TG_CHAT_ID, m)
 
-                # сброс тех, кто вышел выше порога
+                # сброс ушедших выше порога
                 active = {iid for iid, _ in rows}
                 for s in list(sym_state.keys()):
                     if s not in active:
